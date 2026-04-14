@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spell Bee</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: system-ui, sans-serif;
+      font-size: 16px;
+      line-height: 1.6;
+      background: #f5f5f5;
+      color: #1a1a1a;
+      min-height: 100dvh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .card {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 12px;
+      padding: 32px;
+      width: 100%;
+      max-width: 420px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    h1 {
+      font-size: 22px;
+      font-weight: 700;
+      text-align: center;
+    }
+
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      color: #555;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #ccc;
+      flex-shrink: 0;
+    }
+
+    .dot.green {
+      background: #22c55e;
+    }
+
+    .dot.yellow {
+      background: #f59e0b;
+    }
+
+    .dot.red {
+      background: #ef4444;
+    }
+
+    .score-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .score-box {
+      background: #f9f9f9;
+      border: 1px solid #eee;
+      border-radius: 8px;
+      padding: 12px;
+      text-align: center;
+    }
+
+    .score-box .label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #888;
+      margin-bottom: 4px;
+    }
+
+    .score-box .val {
+      font-size: 28px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .instruction {
+      background: #f0f9ff;
+      border: 1px solid #bae6fd;
+      border-radius: 8px;
+      padding: 12px 16px;
+      font-size: 14px;
+      color: #0369a1;
+      min-height: 48px;
+    }
+
+    button {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s, background 0.15s;
+    }
+
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    #btnStart {
+      background: #16a34a;
+      color: #fff;
+    }
+
+    #btnStart:not(:disabled):hover {
+      background: #15803d;
+    }
+
+    .log {
+      background: #1a1a1a;
+      color: #a3e635;
+      font-family: monospace;
+      font-size: 12px;
+      border-radius: 8px;
+      padding: 10px 12px;
+      height: 120px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .log span {
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .log .err {
+      color: #f87171;
+    }
+
+    .log .inf {
+      color: #60a5fa;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="card">
+    <h1>🐝 Spell Bee</h1>
+
+    <div class="status-row">
+      <div class="dot" id="dot"></div>
+      <span id="statusText">Not connected</span>
+    </div>
+
+    <div class="score-grid">
+      <div class="score-box">
+        <div class="label">Score</div>
+        <div class="val" id="score">—</div>
+      </div>
+      <div class="score-box">
+        <div class="label">Word</div>
+        <div class="val" id="word">— / —</div>
+      </div>
+    </div>
+
+    <div class="instruction" id="instruction">Press Start Game to connect and play.</div>
+
+    <button id="btnStart">Start Game</button>
+
+    <!-- Hidden audio element — plays the bot's TTS voice -->
+    <audio id="botAudio" autoplay playsinline></audio>
+
+    <div class="log" id="log" role="log" aria-label="Debug log"></div>
+  </div>
+
+  <script>
+    const SERVER_URL = 'http://localhost:7860';
+
+    const dot = document.getElementById('dot');
+    const statusText = document.getElementById('statusText');
+    const scoreEl = document.getElementById('score');
+    const wordEl = document.getElementById('word');
+    const instrEl = document.getElementById('instruction');
+    const btnStart = document.getElementById('btnStart');
+    const botAudio = document.getElementById('botAudio');
+    const logEl = document.getElementById('log');
+
+    // ── Helpers ───────────────────────────────────────────────────────
+    function log(msg, cls = '') {
+      const s = document.createElement('span');
+      if (cls) s.className = cls;
+      const d = new Date();
+      const ts = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+      s.textContent = `[${ts}] ${msg}`;
+      logEl.appendChild(s);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(color, text) {
+      dot.className = `dot ${color}`;
+      statusText.textContent = text;
+    }
+
+    // ── Game state from server data-channel messages ──────────────────
+    function onGameUpdate({ state, score, current_word_idx, total_words }) {
+      scoreEl.textContent = score ?? '—';
+      wordEl.textContent = total_words > 0
+        ? `${current_word_idx + 1} / ${total_words}`
+        : '— / —';
+
+      switch (state) {
+        case 'IDLE':
+          btnStart.disabled = false;
+          instrEl.textContent = 'Press Start Game to begin!';
+          setStatus('green', 'Ready');
+          break;
+        case 'SPEAKING':
+          btnStart.disabled = true;
+          instrEl.textContent = 'Listen carefully to the word…';
+          setStatus('yellow', 'Bot speaking');
+          break;
+        case 'LISTENING':
+          btnStart.disabled = true;
+          instrEl.textContent = 'Your turn — spell the word letter by letter out loud.';
+          setStatus('green', 'Listening…');
+          break;
+        case 'EVALUATING':
+          btnStart.disabled = true;
+          instrEl.textContent = 'Checking your answer…';
+          setStatus('yellow', 'Evaluating');
+          break;
+        case 'GAME_OVER':
+          btnStart.disabled = false;   // re-enable for replay
+          instrEl.textContent = `Game over! You scored ${score} / ${total_words}. Press Start Game to play again.`;
+          setStatus('green', 'Game over');
+          log(`Finished — score: ${score}/${total_words}`, 'inf');
+          break;
+      }
+    }
+
+    // ── WebRTC state (single connection for the tab lifetime) ─────────
+    let pc = null;   // RTCPeerConnection
+    let dataChannel = null;   // RTCDataChannel for JSON messages
+    let localStream = null;   // microphone MediaStream
+
+    async function connect() {
+      // 1. Get microphone access
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        log('Mic access granted', 'inf');
+      } catch (err) {
+        log(`Mic error: ${err.message}`, 'err');
+        setStatus('red', 'Mic denied');
+        instrEl.textContent = 'Microphone access is required. Allow it and refresh.';
+        return;
+      }
+
+      // 2. Create peer connection
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      });
+
+      // 3. Add mic track so server receives your voice
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+      // 4. Play bot audio when track arrives
+      pc.ontrack = (evt) => {
+        log('Remote audio track received', 'inf');
+        botAudio.srcObject = evt.streams[0];
+      };
+
+      // 5. Data channel for game state messages (server → client)
+      dataChannel = pc.createDataChannel('pipecat-messages');
+      dataChannel.onopen = () => log('Data channel open', 'inf');
+      dataChannel.onclose = () => log('Data channel closed');
+      dataChannel.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg?.type === 'SPELL_BEE_UPDATE') {
+            log(`state=${msg.state} score=${msg.score} word=${msg.current_word_idx + 1}/${msg.total_words}`);
+            onGameUpdate(msg);
+          }
+        } catch (_) { /* non-JSON frame, ignore */ }
+      };
+
+      pc.onconnectionstatechange = () => {
+        log(`Connection state: ${pc.connectionState}`);
+        if (pc.connectionState === 'connected') {
+          setStatus('green', 'Connected — ready');
+          instrEl.textContent = "Connected! Press Start Game whenever you're ready.";
+          btnStart.disabled = false;
+          log('WebRTC connected', 'inf');
+        }
+        if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+          setStatus('red', 'Disconnected');
+          instrEl.textContent = 'Connection lost. Refresh the page to reconnect.';
+          btnStart.disabled = true;
+          pc = null; dataChannel = null;
+        }
+      };
+
+      // 6. Create SDP offer
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // 7. Wait for ICE gathering to complete
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') return resolve();
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === 'complete') resolve();
+        };
+      });
+
+      // 8. Send offer to Pipecat server's /connect endpoint
+      log('Sending SDP offer to server…', 'inf');
+      setStatus('yellow', 'Negotiating…');
+      instrEl.textContent = 'Connecting to server…';
+
+      let answer;
+      try {
+        const resp = await fetch(`${SERVER_URL}/connect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sdp: pc.localDescription.sdp,
+            type: pc.localDescription.type,
+          }),
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        answer = await resp.json();
+      } catch (err) {
+        log(`Server error: ${err.message}`, 'err');
+        setStatus('red', 'Server unreachable');
+        instrEl.textContent = 'Could not reach server. Make sure server.py is running on port 7860.';
+        btnStart.disabled = false;
+        return;
+      }
+
+      // 9. Apply server's SDP answer
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      log('SDP answer applied — waiting for connection…', 'inf');
+    }
+
+    // ── Start / restart game (reuses same pc + dataChannel) ──────────
+    btnStart.addEventListener('click', async () => {
+      // First click: need to connect first
+      if (!pc || pc.connectionState !== 'connected') {
+        btnStart.disabled = true;
+        setStatus('yellow', 'Connecting…');
+        await connect();
+        return;
+      }
+
+      // Subsequent clicks: game already connected, just send START_GAME
+      btnStart.disabled = true;
+      if (dataChannel?.readyState === 'open') {
+        dataChannel.send(JSON.stringify({ type: 'START_GAME' }));
+        log('Sent START_GAME', 'inf');
+        instrEl.textContent = 'Game starting — listen for the first word…';
+        setStatus('yellow', 'Starting…');
+      } else {
+        log('Data channel not open', 'err');
+        btnStart.disabled = false;
+      }
+    });
+  </script>
+</body>
+
+</html>
