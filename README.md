@@ -16,6 +16,7 @@ cd SpellBee
 Install the necessary packages using the uv package manager (recommended) or pip
 
 ```bash
+cd server
 uv sync
 ```
 ### 3. Configure API Keys
@@ -23,6 +24,5 @@ replace the Deepgram and Groq API keys with your own credentials in .env file.
 
 ### 4. Start the Server
 ```bash
-cd server
 python server.py
 ```
