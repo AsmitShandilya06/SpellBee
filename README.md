@@ -16,7 +16,7 @@ cd SpellBee
 Install the necessary packages using the uv package manager (recommended) or pip
 
 ```bash
-cd server
+cd pipecat-quickstart/server
 uv sync
 ```
 ### 3. Configure API Keys
