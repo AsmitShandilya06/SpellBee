@@ -10,9 +10,9 @@ from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
-    EndFrame, Frame, TextFrame, TranscriptionFrame,
+    EndFrame, Frame, TranscriptionFrame,
     OutputTransportMessageFrame, BotStartedSpeakingFrame, BotStoppedSpeakingFrame,
-    UserStartedSpeakingFrame,
+    UserStartedSpeakingFrame, CancelFrame, TTSSpeakFrame
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -26,116 +26,128 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 load_dotenv(override=True)
 
-# ── Word list ──────────────────────────────────────────────────────────────
 WORD_LIST = [
     "cat", "dog", "apple", "bridge", "cloud",
     "dance", "earth", "flame", "grace", "happy",
 ]
 
-# ── State machine ──────────────────────────────────────────────────────────
 class GameState(Enum):
-    IDLE       = auto()
-    SPEAKING   = auto()     # Bot is asking the word
-    LISTENING  = auto()     # Bot is waiting for the spelling
-    WARNING    = auto()     # Bot is scolding the user for interrupting
-    EVALUATING = auto()     # Groq is extracting/grading the spelling
-    GAME_OVER  = auto()
+    IDLE        = auto()
+    SPEAKING    = auto()    
+    LISTENING   = auto()    
+    WARNING     = auto()    
+    EVALUATING  = auto()    
+    GAME_OVER   = auto()
 
-
-# ── Game logic processor ───────────────────────────────────────────────────
 class SpellBeeProcessor(FrameProcessor):
-
     def __init__(self, word_list: list):
         super().__init__()
-        self.word_list   = word_list
+        self.word_list = word_list
         self.current_idx = 0
-        self.score       = 0
-        self.state       = GameState.IDLE
-        self.interrupted = False
-        
-        # Initialize Groq client for intent parsing and spelling extraction
+        self.score = 0
+        self.state = GameState.IDLE
+        self.bot_speaking = False
+        self.interrupted = False  # Track if the current speech was cut off
+
         self.llm = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+
+    async def _speak_text(self, text: str):
+        """Forces TTS to process the block instantly using boundary frames."""
+        await self.push_frame(TTSSpeakFrame(text))
 
     async def start_game(self):
         logger.info("SpellBeeProcessor: game starting")
         self.current_idx = 0
-        self.score       = 0
-        self.state       = GameState.SPEAKING
+        self.score = 0
+        self.state = GameState.SPEAKING
+        self.bot_speaking = False
         self.interrupted = False
         
-        word  = self.word_list[self.current_idx]
+        word = self.word_list[self.current_idx]
         intro = (
             f"Welcome to Spell Bee! I will say a word and you spell it letter by letter. "
             f"Ready? Your first word is: {word}. Please spell {word}."
         )
-        await self.push_frame(TextFrame(intro))
+        await self._speak_text(intro)
         await self._push_ui_update()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        # 1. ALWAYS pass to super() first. This allows Pipecat's native interruption 
-        # engine to see the UserStartedSpeakingFrame and immediately kill the TTS audio.
         await super().process_frame(frame, direction)
 
-        # 2. Bot started playing audio on user's speakers
-        if isinstance(frame, BotStartedSpeakingFrame):
+        # ── Interruptions ──────────────────────────────────────────────────
+        if isinstance(frame, UserStartedSpeakingFrame):
+            if self.bot_speaking:
+                logger.info("User interrupted bot! Canceling output...")
+                # 1. Fire CancelFrame down to stop TTS audio immediately
+                await self.push_frame(CancelFrame())
+                # 2. Mark that the current run was interrupted
+                self.interrupted = True
+                self.bot_speaking = False 
+                
+                # 3. Transition state so we don't accidentally evaluate the interruption
+                if self.state == GameState.SPEAKING:
+                    self.state = GameState.WARNING
             return
 
-        # 3. Bot finished playing audio on user's speakers
+        # ── Lifecycle ──────────────────────────────────────────────────────
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self.bot_speaking = True
+            self.interrupted = False
+            logger.info("Bot started speaking")
+            return
+
         if isinstance(frame, BotStoppedSpeakingFrame):
+            self.bot_speaking = False
+            logger.info("Bot stopped speaking")
+
+            # If we cancelled the audio, ignore this frame entirely
+            if self.interrupted:
+                self.interrupted = False
+                return
+
             if self.state == GameState.SPEAKING:
-                if not self.interrupted:
-                    # Natural finish. Bot asked the question, now waiting for answer.
-                    self.state = GameState.LISTENING
-                    logger.info("SpellBeeProcessor: LISTENING for user spelling")
-                    await self._push_ui_update()
-            
+                self.state = GameState.LISTENING
+                logger.info("SpellBeeProcessor: LISTENING for user spelling")
+                await self._push_ui_update()
+
             elif self.state == GameState.WARNING:
-                # Bot finished scolding the user. Ask the word again.
                 word = self.word_list[self.current_idx]
                 self.state = GameState.SPEAKING
-                await self.push_frame(TextFrame(f"Now, let's try again. Please spell {word}."))
+                await self._speak_text(f"Now, let's try again. Please spell {word}.")
                 await self._push_ui_update()
-                
+
             elif self.state == GameState.GAME_OVER:
-                # Bot finished reading the final score. Safe to hang up.
                 await self.push_frame(EndFrame())
             return
 
-        # 4. User interrupted the bot via Voice Activity Detection (VAD)
-        if isinstance(frame, UserStartedSpeakingFrame):
-            if self.state in [GameState.SPEAKING, GameState.WARNING]:
-                logger.info("VAD triggered! User interrupted the bot.")
-                self.interrupted = True
-                # We do NOT change state to LISTENING here. We wait for the STT to process their yell.
-            return
-
-        # 5. User finished speaking (Deepgram STT generated the text)
+        # ── Transcription ──────────────────────────────────────────────────
         if isinstance(frame, TranscriptionFrame):
             text = frame.text.strip()
             if not text:
-                return # Ignore throat clears/empty audio
+                return
 
-            if self.interrupted:
-                # The user interrupted the bot. Route to Groq to generate a polite scolding.
-                self.interrupted = False
-                await self._handle_interruption(text)
-            
+            # If we are in Speaking state, the user interrupted us, and this text is WHAT they interrupted with.
+            if self.state == GameState.SPEAKING or self.state == GameState.WARNING:
+                logger.info(f"Received interruption text: '{text}'")
+                # Do NOT transition state here. Let the scold finish, which will transition to SPEAKING.
+                asyncio.create_task(self._handle_interruption(text))
+                
             elif self.state == GameState.LISTENING:
-                # The user spoke at the correct time. Route to Groq for spelling extraction.
-                await self._evaluate_spelling(text)
+                logger.info(f"Received spelling text: '{text}'")
+                asyncio.create_task(self._evaluate_spelling(text))
             
+            else:
+                logger.debug(f"Ignoring transcription in state {self.state.name}: '{text}'")
             return
 
-        # Forward all other frames downstream (e.g., audio bytes)
+        # Forward all other frames (crucial for StartFrame to reach TTS)
         await self.push_frame(frame, direction)
 
-    # ── Groq LLM Logic ─────────────────────────────────────────────────────
-
     async def _handle_interruption(self, user_text: str):
-        """Uses Groq to understand intent and politely scold the user."""
-        self.state = GameState.WARNING
-        logger.info(f"Processing interruption via Groq for text: '{user_text}'")
+        # Pause briefly to ensure CancelFrame has flushed the TTS buffers
+        await asyncio.sleep(0.5) 
         
+        logger.info(f"Processing interruption via Groq for text: '{user_text}'")
         system_prompt = (
             "You are an AI hosting a Spell Bee. The user interrupted you while you were speaking. "
             f"They said: '{user_text}'. "
@@ -145,7 +157,7 @@ class SpellBeeProcessor(FrameProcessor):
         
         try:
             response = await self.llm.chat.completions.create(
-                model="llama-3.3-70b-versatile", # Fast, low-latency model for quick conversational replies
+                model="llama-3.3-70b-versatile",
                 messages=[{"role": "system", "content": system_prompt}]
             )
             reply = response.choices[0].message.content
@@ -153,14 +165,12 @@ class SpellBeeProcessor(FrameProcessor):
             logger.error(f"Groq error: {e}")
             reply = "Please wait until I finish speaking before you answer."
             
-        await self.push_frame(TextFrame(reply))
+        await self._speak_text(reply)
         await self._push_ui_update()
 
     async def _evaluate_spelling(self, user_text: str):
-        """Uses Groq to extract the exact spelling letters from conversational speech."""
         self.state = GameState.EVALUATING
         target = self.word_list[self.current_idx]
-        
         logger.info(f"Using Groq to extract spelling from: '{user_text}'")
         
         system_prompt = (
@@ -185,14 +195,12 @@ class SpellBeeProcessor(FrameProcessor):
 
         logger.info(f"Groq extracted: '{extracted}' (Target: '{target}')")
 
-        # 1. Handle invalid/unclear extraction
         if extracted == "invalid":
             reply = f"I didn't quite catch a spelling there. Please spell the word: {target}."
             self.state = GameState.SPEAKING
-            await self.push_frame(TextFrame(reply))
+            await self._speak_text(reply)
             return
 
-        # 2. Grade the spelling
         correct = (extracted == target.lower())
         if correct:
             self.score += 1
@@ -201,20 +209,17 @@ class SpellBeeProcessor(FrameProcessor):
             spelled_out = " ".join(target.upper())
             reply = f"Not quite. The correct spelling is {spelled_out}. "
 
-        # 3. Move to next word or end game
         self.current_idx += 1
         if self.current_idx >= len(self.word_list):
             self.state = GameState.GAME_OVER
             reply += f"That is all the words! Your final score is {self.score} out of {len(self.word_list)}. Great effort!"
-            await self.push_frame(TextFrame(reply))
-            await self._push_ui_update()
-            # Note: We don't push EndFrame() here. We wait for BotStoppedSpeakingFrame in GameState.GAME_OVER.
         else:
             next_word = self.word_list[self.current_idx]
             reply += f"Your next word is: {next_word}. Please spell {next_word}."
             self.state = GameState.SPEAKING
-            await self.push_frame(TextFrame(reply))
-            await self._push_ui_update()
+
+        await self._speak_text(reply)
+        await self._push_ui_update()
 
     async def _push_ui_update(self):
         payload = {
@@ -226,12 +231,9 @@ class SpellBeeProcessor(FrameProcessor):
         }
         await self.push_frame(OutputTransportMessageFrame(message=payload))
 
-
-# ── Pipeline entry — called per browser connection ─────────────────────────
 async def run_bot(webrtc_connection: SmallWebRTCConnection):
     logger.info("Starting Spell Bee bot for new connection")
 
-    # Transport has NO vad_analyzer anymore — clean and simple
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
@@ -247,8 +249,6 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
     )
     spell_bee = SpellBeeProcessor(word_list=WORD_LIST)
 
-    # VADProcessor is defined OUTSIDE transport, as its own pipeline stage
-    # Note: keyword is 'vad_analyzer', NOT 'analyzer'
     vad = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(
             params=VADParams(
@@ -262,7 +262,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
 
     pipeline = Pipeline([
         transport.input(),
-        vad,          # Sits right after the mic, before STT
+        vad,
         stt,
         spell_bee,
         tts,
