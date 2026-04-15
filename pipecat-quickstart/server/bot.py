@@ -52,7 +52,6 @@ class SpellBeeProcessor(FrameProcessor):
         self.llm = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
     async def _speak_text(self, text: str):
-        """Forces TTS to process the block instantly using boundary frames."""
         await self.push_frame(TTSSpeakFrame(text))
 
     async def start_game(self):
@@ -73,23 +72,21 @@ class SpellBeeProcessor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-
-        # ── Interruptions ──────────────────────────────────────────────────
+        
         if isinstance(frame, UserStartedSpeakingFrame):
             if self.bot_speaking:
                 logger.info("User interrupted bot! Canceling output...")
-                # 1. Fire CancelFrame down to stop TTS audio immediately
+               
                 await self.push_frame(CancelFrame())
-                # 2. Mark that the current run was interrupted
+            
                 self.interrupted = True
                 self.bot_speaking = False 
                 
-                # 3. Transition state so we don't accidentally evaluate the interruption
                 if self.state == GameState.SPEAKING:
                     self.state = GameState.WARNING
             return
 
-        # ── Lifecycle ──────────────────────────────────────────────────────
+       
         if isinstance(frame, BotStartedSpeakingFrame):
             self.bot_speaking = True
             self.interrupted = False
@@ -100,7 +97,6 @@ class SpellBeeProcessor(FrameProcessor):
             self.bot_speaking = False
             logger.info("Bot stopped speaking")
 
-            # If we cancelled the audio, ignore this frame entirely
             if self.interrupted:
                 self.interrupted = False
                 return
@@ -120,7 +116,6 @@ class SpellBeeProcessor(FrameProcessor):
                 await self.push_frame(EndFrame())
             return
 
-        # ── Transcription ──────────────────────────────────────────────────
         if isinstance(frame, TranscriptionFrame):
             text = frame.text.strip()
             if not text:
@@ -140,7 +135,6 @@ class SpellBeeProcessor(FrameProcessor):
                 logger.debug(f"Ignoring transcription in state {self.state.name}: '{text}'")
             return
 
-        # Forward all other frames (crucial for StartFrame to reach TTS)
         await self.push_frame(frame, direction)
 
     async def _handle_interruption(self, user_text: str):
